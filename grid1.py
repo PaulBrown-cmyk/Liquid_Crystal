@@ -17,7 +17,8 @@ class CylinderGrid:
             variable_diameter = np.full(self.num_z_levels, self.diameter)
         
         z_boundary = np.linspace(0, self.length, self.num_z_levels)
-        theta = np.linspace(0, 2 * np.pi, self.num_boundary_points_per_z)
+        # Use endpoint=False so the seam at 2π does not duplicate the 0-angle point.
+        theta = np.linspace(0, 2 * np.pi, self.num_boundary_points_per_z, endpoint=False)
         theta, z_boundary = np.meshgrid(theta, z_boundary)
         theta = theta.flatten()
         z_boundary = z_boundary.flatten()
@@ -37,7 +38,8 @@ class CylinderGrid:
     def generate_straight_cylinder_with_grid(self):
         # Boundary points
         z_boundary = np.linspace(0, self.length, self.num_z_levels)
-        theta = np.linspace(0, 2 * np.pi, self.num_boundary_points_per_z)
+        # Use endpoint=False so the seam at 2π does not duplicate the 0-angle point.
+        theta = np.linspace(0, 2 * np.pi, self.num_boundary_points_per_z, endpoint=False)
         theta, z_boundary = np.meshgrid(theta, z_boundary)
         theta = theta.flatten()
         z_boundary = z_boundary.flatten()
@@ -57,7 +59,8 @@ class CylinderGrid:
 
     def generate_bent_cylinder(self, bend_function):
         z_boundary = np.linspace(0, self.length, self.num_z_levels)
-        theta = np.linspace(0, 2 * np.pi, self.num_boundary_points_per_z)
+        # Use endpoint=False so the seam at 2π does not duplicate the 0-angle point.
+        theta = np.linspace(0, 2 * np.pi, self.num_boundary_points_per_z, endpoint=False)
         theta, z_boundary = np.meshgrid(theta, z_boundary)
         theta = theta.flatten()
         z_boundary = z_boundary.flatten()
@@ -81,7 +84,9 @@ class CylinderGrid:
         grid_spacing = self.min_distance
         r_values = np.arange(grid_spacing, self.radius, grid_spacing)
         theta_values = np.arange(0, 2 * np.pi, grid_spacing / self.radius)
-        z_values = np.arange(0, self.length, grid_spacing)
+        # Keep interior points away from the end caps so they do not duplicate
+        # the explicit boundary layers.
+        z_values = np.arange(grid_spacing, self.length, grid_spacing)
 
         R, Theta, Z = np.meshgrid(r_values, theta_values, z_values)
         R = R.flatten()
@@ -101,18 +106,20 @@ class CylinderGrid:
 
     def _generate_interior_grid_points(self):
         grid_spacing = self.min_distance
-        x_values = np.arange(-self.radius, self.radius + grid_spacing, grid_spacing)
-        y_values = np.arange(-self.radius, self.radius + grid_spacing, grid_spacing)
-        z_values = np.arange(0, self.length + grid_spacing, grid_spacing)
+        # Sample only the interior, leaving the side wall and end caps to the
+        # dedicated boundary grid.
+        x_values = np.arange(-self.radius + grid_spacing, self.radius, grid_spacing)
+        y_values = np.arange(-self.radius + grid_spacing, self.radius, grid_spacing)
+        z_values = np.arange(grid_spacing, self.length, grid_spacing)
         
         X, Y, Z = np.meshgrid(x_values, y_values, z_values)
         X = X.flatten()
         Y = Y.flatten()
         Z = Z.flatten()
 
-        # Filter points to be inside the cylinder
+        # Filter points to be strictly inside the cylinder.
         distance_from_axis = np.sqrt(X**2 + Y**2)
-        inside_cylinder = distance_from_axis <= self.radius
+        inside_cylinder = distance_from_axis < self.radius
 
         return X[inside_cylinder], Y[inside_cylinder], Z[inside_cylinder]
 
@@ -149,4 +156,3 @@ if __name__ == '__main__':
     #cylinder.generate_bent_cylinder(bend_function)
     #cylinder.plot_grid()
     #cylinder.save_grid_to_file('bent_cylinder_grid.txt')
-

@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy.optimize import minimize
+from scipy.spatial import cKDTree
 from mpl_toolkits.mplot3d import Axes3D
 from multiprocessing import Pool, cpu_count, Array, Manager, Lock
 plt.rcParams.update({
@@ -82,12 +83,15 @@ class LiquidCrystalCylinder:
         self.W = W  # Rapini-Papoular surface anchoring strength
         self.kT = kT
         self.coordinates_file = coordinates_file
+        self._geometry_prepared = False
 
         if os.path.exists('optimized_director_field.txt'):
-            self.vertices, self.n_x, self.n_y, self.n_z = self.load_director_field('optimized_director_field.txt')
+            # Restart from the last optimized field if it exists.
+            self.load_director_field('optimized_director_field.txt')
         else:
             self.vertices = self.load_coordinates()
             self.n_x, self.n_y, self.n_z = self.initialize_directors()
+            self._prepare_geometry()
 
     def load_coordinates(self):
         vertices = np.loadtxt(self.coordinates_file)
@@ -107,7 +111,152 @@ class LiquidCrystalCylinder:
 
     def normalize_directors(self, n_x, n_y, n_z):
         norm = np.sqrt(n_x**2 + n_y**2 + n_z**2)
+        # Guard against the rare case where a proposal is numerically zero.
+        norm = np.where(norm == 0, 1.0, norm)
         return n_x / norm, n_y / norm, n_z / norm
+
+    def _prepare_geometry(self):
+        """Cache geometry-dependent quantities for the cylinder point cloud."""
+        if self._geometry_prepared:
+            return
+
+        self._spacing = self._estimate_spacing()
+        self._vertex_volume = self._spacing ** 3
+        self._surface_area_weight = self._spacing ** 2
+        self._boundary_mask, self._surface_normals = self._identify_boundary_vertices()
+        self._neighbor_pairs, self._neighbor_vectors, self._neighbor_distances = self._build_neighbor_graph()
+        self._geometry_prepared = True
+
+    def _estimate_spacing(self):
+        """Estimate the characteristic point spacing from nearest-neighbor distances."""
+        if len(self.vertices) < 2:
+            return 1.0
+
+        tree = cKDTree(self.vertices)
+        distances, _ = tree.query(self.vertices, k=min(2, len(self.vertices)))
+        nearest = distances[:, 1] if distances.ndim == 2 else distances[1:]
+        nearest = nearest[np.isfinite(nearest) & (nearest > 0)]
+        if nearest.size == 0:
+            return 1.0
+        return float(np.median(nearest))
+
+    def _identify_boundary_vertices(self):
+        """Identify lateral wall and end-cap nodes and assign outward normals.
+
+        The geometry in this project is a cylinder aligned with the z-axis.
+        If the grid is later rotated, this method should be updated accordingly.
+        """
+        x = self.vertices[:, 0]
+        y = self.vertices[:, 1]
+        z = self.vertices[:, 2]
+        radial_distance = np.sqrt(x**2 + y**2)
+
+        radial_tol = max(0.25 * self._spacing, 1e-12)
+        z_tol = max(0.25 * self._spacing, 1e-12)
+
+        side_mask = np.isclose(radial_distance, radial_distance.max(), atol=radial_tol)
+        z_min_mask = np.isclose(z, z.min(), atol=z_tol)
+        z_max_mask = np.isclose(z, z.max(), atol=z_tol)
+        cap_mask = z_min_mask | z_max_mask
+        boundary_mask = side_mask | cap_mask
+
+        normals = np.zeros_like(self.vertices)
+        for i in np.where(boundary_mask)[0]:
+            contributions = []
+
+            if side_mask[i] and radial_distance[i] > 0:
+                contributions.append(np.array([x[i], y[i], 0.0]) / radial_distance[i])
+
+            if z_min_mask[i]:
+                contributions.append(np.array([0.0, 0.0, -1.0]))
+
+            if z_max_mask[i]:
+                contributions.append(np.array([0.0, 0.0, 1.0]))
+
+            normal = np.sum(contributions, axis=0)
+            norm = np.linalg.norm(normal)
+            if norm == 0:
+                # Fallback for degenerate corner points.
+                normal = np.array([0.0, 0.0, 1.0])
+                norm = 1.0
+            normals[i] = normal / norm
+
+        return boundary_mask, normals
+
+    def _build_neighbor_graph(self, max_neighbors=6):
+        """Build a symmetric nearest-neighbor graph over the point cloud.
+
+        The elastic free energy is evaluated on this graph rather than on array
+        order, because the grid is an unstructured point cloud in physical space.
+        """
+        n_points = len(self.vertices)
+        if n_points < 2:
+            return np.empty((0, 2), dtype=int), np.empty((0, 3)), np.empty(0)
+
+        tree = cKDTree(self.vertices)
+        k = min(max_neighbors + 1, n_points)
+        distances, indices = tree.query(self.vertices, k=k)
+
+        edge_map = {}
+        cutoff = 1.75 * self._spacing
+
+        for i in range(n_points):
+            for j_idx in range(1, k):
+                j = int(indices[i, j_idx])
+                distance = float(distances[i, j_idx])
+                if not np.isfinite(distance) or distance <= 0 or distance > cutoff:
+                    continue
+
+                a, b = sorted((i, j))
+                if a == b:
+                    continue
+
+                # Keep the shortest available bond if the same edge is discovered twice.
+                current = edge_map.get((a, b))
+                if current is None or distance < current:
+                    edge_map[(a, b)] = distance
+
+        if not edge_map:
+            return np.empty((0, 2), dtype=int), np.empty((0, 3)), np.empty(0)
+
+        pairs = np.array(list(edge_map.keys()), dtype=int)
+        distances = np.array([edge_map[tuple(pair)] for pair in pairs], dtype=float)
+        vectors = self.vertices[pairs[:, 1]] - self.vertices[pairs[:, 0]]
+        return pairs, vectors, distances
+
+    @staticmethod
+    def _rotate_about_axis(vector, axis, angle):
+        """Rotate a vector about an axis using Rodrigues' formula."""
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm == 0:
+            return vector
+
+        axis = axis / axis_norm
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        return (
+            vector * cos_angle
+            + np.cross(axis, vector) * sin_angle
+            + axis * np.dot(axis, vector) * (1.0 - cos_angle)
+        )
+
+    @staticmethod
+    def _rotate_about_axis_matrix(matrix, axis, angle):
+        """Rotate a 3x3 tensor with the same Rodrigues rotation used for directors."""
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm == 0:
+            return matrix
+
+        axis = axis / axis_norm
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        K = np.array([
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ])
+        R = np.eye(3) + sin_angle * K + (1.0 - cos_angle) * (K @ K)
+        return R @ matrix @ R.T
 
     def compute_Q_tensor(self, n_x, n_y, n_z):
         S = self.S
@@ -120,6 +269,7 @@ class LiquidCrystalCylinder:
         return Q_xx, Q_xy, Q_xz, Q_yy, Q_yz, Q_zz
 
     def compute_elastic_free_energy(self, n_x, n_y, n_z):
+        self._prepare_geometry()
         A, U, W, S = self.A, self.U, self.W, self.S
         Q_xx, Q_xy, Q_xz, Q_yy, Q_yz, Q_zz = self.compute_Q_tensor(n_x, n_y, n_z)
 
@@ -134,64 +284,52 @@ class LiquidCrystalCylinder:
                     Q_xz * (Q_xx * Q_xz + Q_yy * Q_yz + Q_yz * Q_zz) +
                     Q_yz * (Q_yy * Q_yz + Q_xx * Q_xz + Q_zz * Q_yz)))
 
-        bulk_energy_density = 0.5 * A * (1 - 0.3333 * U) * Tr_Q2 - 0.3333 * A * U * Tr_Q3 + 0.25 * A * U * Tr_Q2**2
-
-        # Cholesteric energy density
-        L = 6.0E-12                 # Elastic constant in N
-        #q_0 = 2 * np.pi / (1e-6)   # Pitch wave number in units of m^-1
-        q_0 = 2 * np.pi / (0.5e-6)  # Pitch wave number in units of m^-1
-
-        # Compute derivatives of Q-tensor components
-        dQ_dx = np.gradient(Q_xx, 0.1, edge_order=2, axis=0)
-        dQ_dy = np.gradient(Q_yy, 0.1, edge_order=2, axis=0)
-        dQ_dz = np.gradient(Q_zz, 0.1, edge_order=2, axis=0)
-
-        gradient_energy_density = 0.5 * L * (dQ_dx**2 + dQ_dy**2 + dQ_dz**2)
-
-        levi_civita = np.zeros((3, 3, 3))
-        levi_civita[0, 1, 2] = levi_civita[1, 2, 0] = levi_civita[2, 0, 1] = 1
-        levi_civita[0, 2, 1] = levi_civita[1, 0, 2] = levi_civita[2, 1, 0] = -1
-
-        cholesteric_energy_density = 2 * q_0 * L * (
-            levi_civita[0, 1, 2] * Q_xx * dQ_dx +
-            levi_civita[1, 2, 0] * Q_yy * dQ_dy +
-            levi_civita[2, 0, 1] * Q_zz * dQ_dz
+        # Landau-de Gennes bulk free energy density.
+        bulk_energy_density = (
+            0.5 * A * (1.0 - U / 3.0) * Tr_Q2
+            - (A * U / 3.0) * Tr_Q3
+            + 0.25 * A * U * Tr_Q2**2
         )
+        bulk_energy = np.sum(bulk_energy_density) * self._vertex_volume
 
-        total_energy_density = bulk_energy_density + gradient_energy_density + cholesteric_energy_density
+        # Discrete cholesteric / elastic coupling on the nearest-neighbor graph.
+        # Each bond compares Q_j to Q_i rotated by the preferred helical twist
+        # about the bond axis. This is a graph-based approximation to the
+        # continuum gradient terms that respects the unstructured cylinder grid.
+        L = 6.0E-12                 # Elastic constant in N
+        q_0 = 2 * np.pi / (0.5e-6)  # Preferred helical wave number in m^-1
 
-        # Rapini-Papoular surface energy term using vectorized operations
-        surface_energy_density = np.zeros_like(bulk_energy_density)
-        mask = np.logical_or(np.isclose(self.vertices[:, 2], self.vertices[:, 2].max()),
-                            np.isclose(self.vertices[:, 2], self.vertices[:, 2].min()))
+        Q_matrices = np.empty((len(n_x), 3, 3))
+        Q_matrices[:, 0, 0] = Q_xx
+        Q_matrices[:, 0, 1] = Q_matrices[:, 1, 0] = Q_xy
+        Q_matrices[:, 0, 2] = Q_matrices[:, 2, 0] = Q_xz
+        Q_matrices[:, 1, 1] = Q_yy
+        Q_matrices[:, 1, 2] = Q_matrices[:, 2, 1] = Q_yz
+        Q_matrices[:, 2, 2] = Q_zz
 
-        n = np.column_stack((self.vertices[:, 0], self.vertices[:, 1], np.zeros(len(self.vertices))))
-        norm_n = np.linalg.norm(n, axis=1)
-        valid_indices = norm_n != 0
-        n[valid_indices] /= norm_n[valid_indices][:, np.newaxis]
+        elastic_energy = 0.0
+        for (i, j), bond_vector, bond_length in zip(self._neighbor_pairs, self._neighbor_vectors, self._neighbor_distances):
+            if bond_length <= 0:
+                continue
 
-        delta_ij = np.eye(3)
-        p_ij = delta_ij - np.einsum('ij,ik->ijk', n, n)
+            bond_axis = bond_vector / bond_length
+            preferred_rotation = q_0 * bond_length
+            Q_i_rot = self._rotate_about_axis_matrix(Q_matrices[i], bond_axis, preferred_rotation)
+            delta_Q = Q_matrices[j] - Q_i_rot
 
-        for i in range(len(n_x)):
-            R_xx = Q_xx[i] + 0.3333 * S
-            R_xy = Q_xy[i]
-            R_xz = Q_xz[i]
-            R_yy = Q_yy[i] + 0.3333 * S
-            R_yz = Q_yz[i]
-            R_zz = Q_zz[i] + 0.3333 * S
-            R = np.array([[R_xx, R_xy, R_xz], [R_xy, R_yy, R_yz], [R_xz, R_yz, R_zz]])
+            # Bond energy approximates \int (L/2)|∇Q|^2 dV on a point cloud.
+            bond_weight = self._vertex_volume / (bond_length**2)
+            elastic_energy += 0.5 * L * bond_weight * np.sum(delta_Q**2)
 
-            K = np.einsum('ij,jk,kl->il', p_ij[i], R, p_ij[i])
+        # Rapini-Papoular anchoring on the actual cylinder boundary only.
+        # We use planar anchoring: the director prefers to lie tangent to the surface.
+        surface_energy = 0.0
+        if np.any(self._boundary_mask):
+            boundary_n = np.column_stack((n_x, n_y, n_z))
+            alignment = np.sum(boundary_n * self._surface_normals, axis=1)
+            surface_energy = 0.5 * W * self._surface_area_weight * np.sum(alignment[self._boundary_mask] ** 2)
 
-            energy_rp = 0.5 * W * np.sum((R - K)**2)
-
-            surface_energy_density[i] = energy_rp
-
-            if np.isnan(energy_rp):
-                print(f'NaN detected in surface energy at index {i}: R={R}, K={K}, energy_rp={energy_rp}')
-
-        total_energy = np.sum(total_energy_density) + np.sum(surface_energy_density)
+        total_energy = bulk_energy + elastic_energy + surface_energy
 
         if np.isnan(total_energy):
             print('NaN detected in total energy')
@@ -199,14 +337,14 @@ class LiquidCrystalCylinder:
         return total_energy
 
     def apply_periodic_boundary_conditions(self):
-        self.n_x[0] = self.n_x[-1]
-        self.n_y[0] = self.n_y[-1]
-        self.n_z[0] = self.n_z[-1]
+        # Cylindrical geometry is not periodic; the boundary is handled explicitly
+        # by the surface energy term and the geometry masks.
         return self.n_x, self.n_y, self.n_z
 
     def plot_director_field(self, ax, iteration=None):
         ax.clear()
         norm = np.sqrt(self.n_x**2 + self.n_y**2 + self.n_z**2)
+        norm = np.where(norm == 0, 1.0, norm)
         # Adjust the scaling factor to ensure visibility
         scaling_factor = 10  # Increase or adjust this factor to make changes more visible
         ax.quiver((self.vertices[:, 0])*1e6, (self.vertices[:, 1])*1e6, (self.vertices[:, 2])*1e6,
@@ -234,17 +372,16 @@ class LiquidCrystalCylinder:
             for i in range(len(self.vertices)):
                 f.write(f'{self.vertices[i, 0]:.6e}     {self.vertices[i, 1]:.6e}     {self.vertices[i, 2]:.6e}     {self.n_x[i]:.6e}     {self.n_y[i]:.6e}     {self.n_z[i]:.6e}\n')
 
-    def load_director_field(self, filename):
-        with open(filename, 'r') as f:
-            lines = f.readlines()[1:]  # Skip header line
-            data = np.array([list(map(float, line.split())) for line in lines])
-            self.vertices = data[:, :3]
-            self.n_x = data[:, 3]
-            self.n_y = data[:, 4]
-            self.n_z = data[:, 5]
-
     def create_movie_from_checkpoints(self, output_filename='simulation.mp4', frame_rate=5):
-        checkpoint_files = sorted([file for file in os.listdir() if file.startswith('checkpoint_iter_')])
+        import re
+
+        checkpoint_files = sorted(
+            [file for file in os.listdir() if file.startswith('checkpoint_iter_')],
+            key=lambda filename: int(re.findall(r'\d+', filename)[0]),
+        )
+        if not checkpoint_files:
+            logger.info('No checkpoint files were found, so no movie was created.')
+            return
 
         fig = plt.figure(figsize=(10, 10), dpi=100)
         ax = fig.add_subplot(111, projection='3d')
@@ -312,53 +449,13 @@ class LiquidCrystalCylinder:
         if checkpoint_file is not None:
             self.load_director_field(checkpoint_file)
             logger.info(f'Restarted from checkpoint: {checkpoint_file}')
-            init_shared_memory(self.n_x, self.n_y, self.n_z)  # Initialize shared memory with loaded data
+            # The sequential path reads directly from the loaded arrays.
 
         if parallel:
-            num_processes = cpu_count()
-            iterations_per_process = iterations // num_processes
-            seeds = np.random.randint(0, 10000, num_processes)
-
-            if checkpoint_file is None:
-                init_shared_memory(self.n_x, self.n_y, self.n_z)
-
-            with Manager() as manager:
-                results = manager.list()
-                with Pool(processes=num_processes, initializer=init_shared_memory, initargs=(self.n_x, self.n_y, self.n_z)) as pool:
-                    combined_energies = []
-
-                    for start in range(0, iterations, checkpoint_interval):
-                        if terminate:
-                            break
-                        remaining_iterations = min(checkpoint_interval, iterations - start)
-                        result_objects = [pool.apply_async(self._monte_carlo_worker_dynamic, args=(remaining_iterations, seed)) for seed in seeds]
-
-                        changes_x = np.zeros_like(self.n_x)
-                        changes_y = np.zeros_like(self.n_y)
-                        changes_z = np.zeros_like(self.n_z)
-
-                        for result in result_objects:
-                            changes_x_worker, changes_y_worker, changes_z_worker, energies = result.get()
-                            changes_x += changes_x_worker
-                            changes_y += changes_y_worker
-                            changes_z += changes_z_worker
-                            combined_energies.extend(energies)
-
-                        with lock:
-                            n_x_shared[:] = (shared_memory_to_array(n_x_shared, self.n_x.shape) + changes_x).flatten()
-                            n_y_shared[:] = (shared_memory_to_array(n_y_shared, self.n_y.shape) + changes_y).flatten()
-                            n_z_shared[:] = (shared_memory_to_array(n_z_shared, self.n_z.shape) + changes_z).flatten()
-
-                        self.n_x = shared_memory_to_array(n_x_shared, self.n_x.shape)
-                        self.n_y = shared_memory_to_array(n_y_shared, self.n_y.shape)
-                        self.n_z = shared_memory_to_array(n_z_shared, self.n_z.shape)
-                        checkpoint_filename = f'checkpoint_iter_{start + remaining_iterations}.txt'
-                        self.save_director_field(checkpoint_filename)
-                        logger.info(f'Checkpoint saved at iteration {start + remaining_iterations}')
-
-                    self.plot_energy_per_iteration(combined_energies)
-
-                return combined_energies
+            # The old parallel update scheme combined independent trajectories
+            # into one shared state, which is not a valid Monte Carlo update for
+            # a coupled elastic system. Keep the API, but run sequentially.
+            logger.warning('parallel=True is disabled for coupled Monte Carlo updates; running sequentially instead.')
 
         current_energy = self.compute_elastic_free_energy(self.n_x, self.n_y, self.n_z)
         logger.info(f'Initial energy: {current_energy}')
@@ -371,7 +468,7 @@ class LiquidCrystalCylinder:
             self.n_x, self.n_y, self.n_z, current_energy = self._monte_carlo_step(self.n_x, self.n_y, self.n_z, current_energy)
             energies.append(current_energy)
 
-            if ax and i % 100 == 0:
+            if ax is not None and i % 100 == 0:
                 self.update_animation(ax, iteration)
                 logger.info(f'Step {i}: Elastic free energy = {current_energy}')
 
@@ -380,12 +477,12 @@ class LiquidCrystalCylinder:
                 self.save_director_field(checkpoint_filename)
                 logger.info(f'Checkpoint saved at iteration {i}')
 
-            if i == iterations:
-                logger.info('Minimization complete!')
-                self.save_director_field('optimized_director_field.txt')
-                break
-
         self.plot_energy_per_iteration(energies)
+
+        if not terminate:
+            logger.info('Minimization complete!')
+            self.save_director_field('optimized_director_field.txt')
+
         return energies
 
 
@@ -410,27 +507,47 @@ class LiquidCrystalCylinder:
             return n_x, n_y, n_z, current_energy
 
     def _perturb_directors(self, n_x, n_y, n_z):
+        # Use a small local rotation so the Metropolis step explores the energy
+        # landscape gradually instead of replacing a director with a random vector.
         num_vertices = len(n_x)
         i = np.random.randint(0, num_vertices)
-        theta = np.random.rand() * 2 * np.pi
-        phi = np.random.rand() * np.pi
-        n_x[i] = np.cos(theta) * np.sin(phi)
-        n_y[i] = np.sin(theta) * np.sin(phi)
-        n_z[i] = np.cos(phi)
+        current = np.array([n_x[i], n_y[i], n_z[i]])
+
+        random_vector = np.random.normal(size=3)
+        random_vector -= np.dot(random_vector, current) * current
+        norm = np.linalg.norm(random_vector)
+        if norm == 0:
+            random_vector = np.array([1.0, 0.0, 0.0])
+            random_vector -= np.dot(random_vector, current) * current
+            norm = np.linalg.norm(random_vector)
+
+        rotation_axis = random_vector / norm
+        rotation_angle = np.deg2rad(10.0) * (2.0 * np.random.rand() - 1.0)
+        rotated = self._rotate_about_axis(current, rotation_axis, rotation_angle)
+
+        n_x[i], n_y[i], n_z[i] = rotated
         return n_x, n_y, n_z
 
 
     def minimize_free_energy_conjugate_gradient(self, ax):
+        callback_counter = [0]
+
         def objective_function(params):
-            n_x, n_y, n_z = params[:len(self.vertices)], params[len(self.vertices):2*len(self.vertices)], params[2*len(self.vertices):]
+            n_x = params[:len(self.vertices)]
+            n_y = params[len(self.vertices):2*len(self.vertices)]
+            n_z = params[2*len(self.vertices):]
+            n_x, n_y, n_z = self.normalize_directors(n_x, n_y, n_z)
             return self.compute_elastic_free_energy(n_x, n_y, n_z)
 
         def callback(params):
-            n_x, n_y, n_z = params[:len(self.vertices)], params[len(self.vertices):2*len(self.vertices)], params[2*len(self.vertices):]
+            n_x = params[:len(self.vertices)]
+            n_y = params[len(self.vertices):2*len(self.vertices)]
+            n_z = params[2*len(self.vertices):]
             n_x, n_y, n_z = self.normalize_directors(n_x, n_y, n_z)
             self.n_x, self.n_y, self.n_z = n_x, n_y, n_z
-            iteration = [0]
+            iteration = [callback_counter[0]]
             self.update_animation(ax, iteration)
+            callback_counter[0] += 1
 
         params_initial = np.concatenate([self.n_x, self.n_y, self.n_z])
         result = minimize(objective_function, params_initial, method='CG', callback=callback, tol=1e-6)
@@ -441,30 +558,29 @@ class LiquidCrystalCylinder:
         return self.n_x, self.n_y, self.n_z
 
     def load_director_field(self, filename):
-        with open(filename, 'r') as f:
-            lines = f.readlines()[1:]  # Skip header line
-            data = np.array([list(map(float, line.split())) for line in lines])
-            self.vertices = data[:, :3]
-            self.n_x = data[:, 3]
-            self.n_y = data[:, 4]
-            self.n_z = data[:, 5]
-        logger.info(f'Loaded director field from {filename}')
-
-    def load_director_field(self, filename):
         data = np.loadtxt(filename)
-        print(f"Loaded data shape: {data.shape}")  # Debugging print
-        vertices = data[:, :3]
-        n_x = data[:, 3]
-        n_y = data[:, 4]
-        n_z = data[:, 5]
-        print(f"Loaded vertices shape: {vertices.shape}, n_x shape: {n_x.shape}, n_y shape: {n_y.shape}, n_z shape: {n_z.shape}")  # Debugging print
-        return vertices, n_x, n_y, n_z
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+        if data.shape[1] < 6:
+            raise ValueError(f'{filename} does not contain x, y, z, n_x, n_y, n_z columns')
+
+        self.vertices = data[:, :3]
+        self.n_x = data[:, 3]
+        self.n_y = data[:, 4]
+        self.n_z = data[:, 5]
+        self._geometry_prepared = False
+        self._prepare_geometry()
+        logger.info(f'Loaded director field from {filename}')
+        return self.vertices, self.n_x, self.n_y, self.n_z
 
     def plot_energy_per_iteration(self, energies):
+        if not energies:
+            logger.warning('No energies were recorded, so no energy plot was created.')
+            return
         plt.figure(figsize=(10, 6))
         plt.plot(energies, label='Elastic Free Energy')
         plt.xlabel('Iteration', size=20)
-        plt.ylabel('F (kJ)', size=20)
+        plt.ylabel('F (J)', size=20)
         plt.title('Free Energy Per Iteration')
         plt.legend()
         plt.grid(True)
@@ -473,7 +589,10 @@ class LiquidCrystalCylinder:
 
     def plot_angle_histogram(self):
         # Calculate the angles of the directors relative to the z-axis
-        angles = np.arccos(self.n_z / np.sqrt(self.n_x**2 + self.n_y**2 + self.n_z**2))
+        norm = np.sqrt(self.n_x**2 + self.n_y**2 + self.n_z**2)
+        norm = np.where(norm == 0, 1.0, norm)
+        cos_theta = np.clip(self.n_z / norm, -1.0, 1.0)
+        angles = np.arccos(cos_theta)
         angles_degrees = np.degrees(angles)
 
         with open('Director_Angles.txt', mode='w') as f:
@@ -483,7 +602,7 @@ class LiquidCrystalCylinder:
 
         plt.figure(figsize=(8, 6))
         plt.hist(angles_degrees, bins=30, edgecolor='k', alpha=0.7)
-        plt.xlabel('Angle ($^{\circ}$)', size=20)
+        plt.xlabel(r'Angle ($^{\circ}$)', size=20)
         plt.ylabel('Frequency', size=20)
         plt.title('Histogram of Director Angles Relative to the z-axis')
         plt.savefig('histogram.jpg', dpi=600)
@@ -517,14 +636,16 @@ if __name__ == "__main__":
         initial_energy = cylinder.compute_elastic_free_energy(cylinder.n_x, cylinder.n_y, cylinder.n_z)
         logger.info(f'Initial elastic free energy: {initial_energy}')
 
-        cylinder.apply_periodic_boundary_conditions()
-
         remaining_iterations = run_time
 
+    energies = []
     try:
-        energies = cylinder.minimize_free_energy_monte_carlo(ax, iterations=remaining_iterations, parallel=True, checkpoint_file=checkpoint_file)
+        energies = cylinder.minimize_free_energy_monte_carlo(ax, iterations=remaining_iterations, parallel=False, checkpoint_file=checkpoint_file)
     except KeyboardInterrupt:
         logger.info('Execution interrupted by user')
+
+    if not energies:
+        energies = [cylinder.compute_elastic_free_energy(cylinder.n_x, cylinder.n_y, cylinder.n_z)]
 
     final_energy_mc = energies[-1]
     logger.info(f'Final elastic free energy (Monte Carlo): {final_energy_mc / 1000.} kJ')
@@ -536,5 +657,3 @@ if __name__ == "__main__":
     cylinder.plot_energy_per_iteration(energies)
 
     cylinder.create_movie_from_checkpoints(output_filename='cholesteric_LC_simulation.mp4', frame_rate=5)
-
-
