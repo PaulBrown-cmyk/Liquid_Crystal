@@ -1,4 +1,14 @@
 import numpy as np
+import os
+
+# Keep Matplotlib usable in headless shells and CI.
+os.environ["MPLCONFIGDIR"] = os.path.join("/tmp", "codex_mplconfig")
+os.environ["XDG_CACHE_HOME"] = os.path.join("/tmp", "codex_cache")
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+os.makedirs(os.environ["XDG_CACHE_HOME"], exist_ok=True)
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 

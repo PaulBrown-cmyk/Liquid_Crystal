@@ -1,3 +1,5 @@
+"""Archived Monte Carlo solver for historical comparison only."""
+
 #------------------------------------------------#
 #               Import libararies                #
 #------------------------------------------------#
