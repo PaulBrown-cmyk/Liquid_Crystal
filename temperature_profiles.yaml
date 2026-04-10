@@ -1,0 +1,171 @@
+# Named thermal presets for the liquid-crystal FEM solver.
+# Use with:
+#   python LC.py --config lc_fem_config.yaml --temperature-profile gradient_z
+#
+# The boundary-heated and hot-wall presets soften the sidewall anchoring more
+# strongly than the caps so you can study boundary-driven reorientation.
+# The near-transition preset crosses above the thermal transition point so
+# you can watch the director field soften toward isotropy more visibly.
+# The coupled preset combines a hot boundary, bulk softening, and stronger
+# sidewall weakening in one run so the sweep diagnostics can show all three
+# effects together.
+
+uniform:
+  enabled: false
+  mode: uniform
+  law: linear
+  base_temperature_K: 298.15
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 0.0
+  gradient_r_K_per_m: 0.0
+  oscillation_amplitude_K: 0.0
+  oscillation_frequency_hz: 0.0
+  phase_rad: 0.0
+  order_floor: 0.2
+  elastic_alpha_per_K: 0.015
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.025
+  cap_anchoring_alpha_per_K: 0.01
+  mobility_gamma_per_K: 0.01
+  noise_multiplier: 1.0
+
+gradient_z:
+  enabled: true
+  mode: linear_z
+  law: linear
+  base_temperature_K: 300.0
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 1.0e5
+  gradient_r_K_per_m: 0.0
+  oscillation_amplitude_K: 0.0
+  oscillation_frequency_hz: 0.0
+  phase_rad: 0.0
+  order_floor: 0.2
+  elastic_alpha_per_K: 0.015
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.025
+  cap_anchoring_alpha_per_K: 0.01
+  mobility_gamma_per_K: 0.01
+  noise_multiplier: 1.0
+
+oscillatory_z:
+  enabled: true
+  mode: oscillatory_z
+  law: ldg_proxy
+  base_temperature_K: 300.0
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 0.0
+  gradient_r_K_per_m: 0.0
+  oscillation_amplitude_K: 1.5
+  oscillation_frequency_hz: 0.5
+  phase_rad: 0.0
+  order_floor: 0.2
+  elastic_alpha_per_K: 0.015
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.025
+  cap_anchoring_alpha_per_K: 0.01
+  mobility_gamma_per_K: 0.01
+  noise_multiplier: 1.0
+
+boundary_heated:
+  enabled: true
+  mode: linear_r
+  law: linear
+  base_temperature_K: 299.0
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 0.0
+  gradient_r_K_per_m: 8.0e5
+  oscillation_amplitude_K: 0.0
+  oscillation_frequency_hz: 0.0
+  phase_rad: 0.0
+  order_floor: 0.2
+  elastic_alpha_per_K: 0.015
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.04
+  cap_anchoring_alpha_per_K: 0.005
+  mobility_gamma_per_K: 0.01
+  noise_multiplier: 1.0
+
+hot_wall_weak_sidewall:
+  enabled: true
+  mode: linear_r
+  law: ldg_proxy
+  base_temperature_K: 299.5
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 0.0
+  gradient_r_K_per_m: 1.0e6
+  oscillation_amplitude_K: 0.0
+  oscillation_frequency_hz: 0.0
+  phase_rad: 0.0
+  order_floor: 0.2
+  elastic_alpha_per_K: 0.015
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.06
+  cap_anchoring_alpha_per_K: 0.005
+  mobility_gamma_per_K: 0.01
+  noise_multiplier: 1.0
+
+near_transition_drive:
+  enabled: true
+  mode: oscillatory_z
+  law: ldg_proxy
+  base_temperature_K: 306.2
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 0.0
+  gradient_r_K_per_m: 0.0
+  oscillation_amplitude_K: 2.0
+  oscillation_frequency_hz: 0.25
+  phase_rad: 0.0
+  order_floor: 0.05
+  elastic_alpha_per_K: 0.015
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.03
+  cap_anchoring_alpha_per_K: 0.01
+  mobility_gamma_per_K: 0.02
+  noise_multiplier: 1.5
+
+transition_cycle:
+  enabled: true
+  mode: oscillatory_z
+  law: ldg_proxy
+  base_temperature_K: 306.7
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 0.0
+  gradient_r_K_per_m: 0.0
+  oscillation_amplitude_K: 1.1
+  oscillation_frequency_hz: 0.2
+  phase_rad: 0.0
+  order_floor: 0.05
+  elastic_alpha_per_K: 0.015
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.03
+  cap_anchoring_alpha_per_K: 0.01
+  mobility_gamma_per_K: 0.02
+  noise_multiplier: 1.5
+
+coupled_boundary_bulk_transition:
+  enabled: true
+  mode: linear_r
+  law: ldg_proxy
+  base_temperature_K: 304.5
+  reference_temperature_K: 298.15
+  transition_temperature_K: 307.0
+  gradient_z_K_per_m: 0.0
+  gradient_r_K_per_m: 1.0e6
+  oscillation_amplitude_K: 0.0
+  oscillation_frequency_hz: 0.0
+  phase_rad: 0.0
+  order_floor: 0.05
+  elastic_alpha_per_K: 0.02
+  anchoring_alpha_per_K: 0.02
+  sidewall_anchoring_alpha_per_K: 0.08
+  cap_anchoring_alpha_per_K: 0.015
+  mobility_gamma_per_K: 0.02
+  noise_multiplier: 1.25
