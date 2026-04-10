@@ -2,6 +2,7 @@
 #               Import libararies                #
 #------------------------------------------------#
 import io
+import argparse
 import os
 import sys
 import pstats
@@ -653,28 +654,64 @@ def ensure_default_cylinder_grid(filename: str) -> str:
     logger.info(f"Generated default cylinder grid at {filename}")
     return filename
 
-if __name__ == "__main__":
-    import os
+def main(argv=None):
+    """Command-line entry point for the FEM solver."""
     import re
+
+    parser = argparse.ArgumentParser(description="Run the liquid-crystal FEM solver on a cylindrical grid.")
+    parser.add_argument(
+        "--coordinates-file",
+        default="straight_cylinder_grid_with_grid.txt",
+        help="Input point-cloud file produced by grid1.py.",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default=None,
+        help="Optional director checkpoint to resume from.",
+    )
+    parser.add_argument(
+        "--run-time",
+        type=int,
+        default=500,
+        help="Maximum number of FEM optimization iterations.",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        default="cholesteric_fem",
+        help="Prefix for output files.",
+    )
+    parser.add_argument(
+        "--anchoring-preset",
+        default="planar_side_homeotropic_caps",
+        choices=[
+            "planar_side_homeotropic_caps",
+            "planar_all",
+            "homeotropic_all",
+            "free",
+        ],
+        help="Named boundary-anchoring preset to use on the cylinder hull.",
+    )
+    args = parser.parse_args(argv)
 
     # The FEM solver is now the main path for production runs. The legacy
     # Monte Carlo implementation above is kept for comparison and historical
     # reference, but the entry point uses the continuum formulation.
-    run_time = 500
-    coordinates_file = ensure_default_cylinder_grid("straight_cylinder_grid_with_grid.txt")
-    checkpoint_file = None
+    coordinates_file = ensure_default_cylinder_grid(args.coordinates_file)
+    checkpoint_file = args.checkpoint_file
 
-    checkpoint_files = [file for file in os.listdir() if file.startswith("checkpoint_iter_")]
-    if checkpoint_files:
-        checkpoint_files.sort(key=lambda f: int(re.findall(r"\d+", f)[0]))
-        checkpoint_file = checkpoint_files[-1]
-        logger.info(f"Found checkpoint {checkpoint_file}; resuming the FEM solver from that state.")
+    if checkpoint_file is None:
+        checkpoint_files = [file for file in os.listdir() if file.startswith("checkpoint_iter_")]
+        if checkpoint_files:
+            checkpoint_files.sort(key=lambda f: int(re.findall(r"\d+", f)[0]))
+            checkpoint_file = checkpoint_files[-1]
+            logger.info(f"Found checkpoint {checkpoint_file}; resuming the FEM solver from that state.")
 
     solver, energies = run_fem_solver(
         coordinates_file=coordinates_file,
         checkpoint_file=checkpoint_file,
-        run_time=run_time,
-        output_prefix="cholesteric_fem",
+        run_time=args.run_time,
+        output_prefix=args.output_prefix,
+        anchoring_preset=args.anchoring_preset,
     )
 
     final_energy = energies[-1]
@@ -683,3 +720,7 @@ if __name__ == "__main__":
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection="3d")
     solver.plot_director_field(ax, title="Relaxed FEM Director Field")
+
+
+if __name__ == "__main__":
+    main()
