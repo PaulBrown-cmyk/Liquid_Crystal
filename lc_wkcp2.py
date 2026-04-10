@@ -25,6 +25,7 @@ from scipy.spatial import cKDTree
 from mpl_toolkits.mplot3d import Axes3D
 from multiprocessing import Pool, cpu_count, Array, Manager, Lock
 from lc_fem import run_fem_solver
+from lc_config import DEFAULT_CONFIG_PATH, load_solver_config
 plt.rcParams.update({
     "text.usetex": False,
     "font.family": "DejaVu Sans",
@@ -629,7 +630,7 @@ class LiquidCrystalCylinder:
         #plt.show()
 
 
-def ensure_default_cylinder_grid(filename: str) -> str:
+def ensure_default_cylinder_grid(filename: str, grid_config: dict | None = None) -> str:
     """Create the default straight-cylinder grid if it is missing.
 
     The continuum solver expects a real point cloud on disk. Generating the
@@ -641,13 +642,15 @@ def ensure_default_cylinder_grid(filename: str) -> str:
 
     from grid1 import CylinderGrid
 
+    grid_config = grid_config or {}
+
     cylinder = CylinderGrid(
-        diameter_um=5,
-        length_um=20,
-        num_boundary_points_per_z=20,
-        num_z_levels=20,
-        num_inner_points=20,
-        min_distance_um=1.0,
+        diameter_um=grid_config.get("diameter_um", 5),
+        length_um=grid_config.get("length_um", 20),
+        num_boundary_points_per_z=grid_config.get("num_boundary_points_per_z", 20),
+        num_z_levels=grid_config.get("num_z_levels", 20),
+        num_inner_points=grid_config.get("num_inner_points", 20),
+        min_distance_um=grid_config.get("min_distance_um", 1.0),
     )
     cylinder.generate_straight_cylinder_with_grid()
     cylinder.save_grid_to_file(filename)
@@ -660,8 +663,13 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(description="Run the liquid-crystal FEM solver on a cylindrical grid.")
     parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help="YAML configuration file with solver defaults.",
+    )
+    parser.add_argument(
         "--coordinates-file",
-        default="straight_cylinder_grid_with_grid.txt",
+        default=None,
         help="Input point-cloud file produced by grid1.py.",
     )
     parser.add_argument(
@@ -672,17 +680,17 @@ def main(argv=None):
     parser.add_argument(
         "--run-time",
         type=int,
-        default=500,
+        default=None,
         help="Maximum number of FEM optimization iterations.",
     )
     parser.add_argument(
         "--output-prefix",
-        default="cholesteric_fem",
+        default=None,
         help="Prefix for output files.",
     )
     parser.add_argument(
         "--anchoring-preset",
-        default="planar_side_homeotropic_caps",
+        default=None,
         choices=[
             "planar_side_homeotropic_caps",
             "planar_all",
@@ -691,13 +699,26 @@ def main(argv=None):
         ],
         help="Named boundary-anchoring preset to use on the cylinder hull.",
     )
+    parser.add_argument(
+        "--solver-method",
+        default=None,
+        choices=["trust-krylov", "newton-cg", "lbfgs"],
+        help="Nonlinear optimizer used by the FEM solver.",
+    )
     args = parser.parse_args(argv)
+
+    config = load_solver_config(args.config)
+    coordinates_file = args.coordinates_file or config["coordinates_file"]
+    checkpoint_file = args.checkpoint_file if args.checkpoint_file is not None else config.get("checkpoint_file")
+    run_time = args.run_time if args.run_time is not None else config["run_time"]
+    output_prefix = args.output_prefix or config["output_prefix"]
+    anchoring_preset = args.anchoring_preset or config["anchoring_preset"]
+    solver_method = args.solver_method or config["solver_method"]
 
     # The FEM solver is now the main path for production runs. The legacy
     # Monte Carlo implementation above is kept for comparison and historical
     # reference, but the entry point uses the continuum formulation.
-    coordinates_file = ensure_default_cylinder_grid(args.coordinates_file)
-    checkpoint_file = args.checkpoint_file
+    coordinates_file = ensure_default_cylinder_grid(coordinates_file, grid_config=config.get("grid"))
 
     if checkpoint_file is None:
         checkpoint_files = [file for file in os.listdir() if file.startswith("checkpoint_iter_")]
@@ -709,9 +730,10 @@ def main(argv=None):
     solver, energies = run_fem_solver(
         coordinates_file=coordinates_file,
         checkpoint_file=checkpoint_file,
-        run_time=args.run_time,
-        output_prefix=args.output_prefix,
-        anchoring_preset=args.anchoring_preset,
+        run_time=run_time,
+        output_prefix=output_prefix,
+        anchoring_preset=anchoring_preset,
+        solver_method=solver_method,
     )
 
     final_energy = energies[-1]

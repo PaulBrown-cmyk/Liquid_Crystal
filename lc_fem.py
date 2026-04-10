@@ -55,6 +55,7 @@ class LiquidCrystalFEMSolver:
         max_iterations: int = 200,
         tolerance: float = 1.0e-8,
         anchoring_preset: str = "planar_side_homeotropic_caps",
+        solver_method: str = "trust-krylov",
     ):
         self._anchoring_presets = {
             # Tangential sidewall plus normal end caps is a common finite-cylinder
@@ -92,6 +93,7 @@ class LiquidCrystalFEMSolver:
         self.max_iterations = max_iterations
         self.tolerance = tolerance
         self.anchoring_preset = anchoring_preset
+        self.solver_method = solver_method
 
         self._configure_anchoring(
             anchoring_preset=anchoring_preset,
@@ -110,6 +112,7 @@ class LiquidCrystalFEMSolver:
         # characteristic elastic energy so the solver sees a healthy magnitude.
         self._energy_scale = max(self.K * self._spacing, 1.0e-30)
         self._gradient_scale = self._energy_scale
+        self._hessp_step = 1.0e-6
         self.directors = self._initialize_directors()
 
         self._build_mesh()
@@ -204,6 +207,30 @@ class LiquidCrystalFEMSolver:
         grad_theta = np.sum(director_grad * dndtheta, axis=1)
         grad_phi = np.sum(director_grad * dndphi, axis=1)
         return np.concatenate([grad_theta, grad_phi])
+
+    def _angle_objective(self, theta_phi: np.ndarray) -> Tuple[float, np.ndarray]:
+        """Return scaled energy and gradient in angle coordinates."""
+        n = self.n_nodes
+        theta = theta_phi[:n]
+        phi = theta_phi[n:]
+        directors = self._angles_to_directors(theta, phi)
+        energy, director_grad = self.compute_energy_and_gradient(directors)
+        angle_grad = self._angles_gradient(director_grad, theta, phi)
+        return energy / self._energy_scale, angle_grad / self._energy_scale
+
+    def _angle_hessp(self, theta_phi: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        """Approximate a Hessian-vector product for Newton-Krylov methods.
+
+        We use a centered finite-difference directional derivative of the
+        scaled angle-space gradient. This keeps the implementation sparse in
+        the optimization sense: the solver only ever sees Hessian-vector
+        products, not a dense Hessian matrix.
+        """
+        step = self._hessp_step
+        forward_energy, forward_grad = self._angle_objective(theta_phi + step * direction)
+        backward_energy, backward_grad = self._angle_objective(theta_phi - step * direction)
+        _ = forward_energy, backward_energy
+        return (forward_grad - backward_grad) / (2.0 * step)
 
     @staticmethod
     def normalize_directors(directors: np.ndarray) -> np.ndarray:
@@ -408,42 +435,63 @@ class LiquidCrystalFEMSolver:
         return grad - radial * directors
 
     def relax(self) -> List[float]:
-        """Relax the director field using an L-BFGS solve in angle space."""
+        """Relax the director field in angle space.
+
+        The default path uses a Newton-Krylov style solve with Hessian-vector
+        products so we can keep the optimization lightweight without forming a
+        dense Hessian. L-BFGS remains available as a fallback for comparison.
+        """
         theta_phi0 = self._directors_to_angles(self.directors)
         initial_energy, _ = self.compute_energy_and_gradient(self.directors)
         energies: List[float] = [initial_energy]
         n = self.n_nodes
-        bounds = [(0.0, 2.0 * np.pi)] * n + [(0.0, np.pi)] * n
-
-        def objective(theta_phi: np.ndarray) -> tuple[float, np.ndarray]:
-            theta = theta_phi[:n]
-            phi = theta_phi[n:]
-            directors = self._angles_to_directors(theta, phi)
-            energy, director_grad = self.compute_energy_and_gradient(directors)
-            angle_grad = self._angles_gradient(director_grad, theta, phi)
-            return energy / self._energy_scale, angle_grad / self._energy_scale
+        method = self.solver_method.lower()
+        if method not in {"lbfgs", "l-bfgs-b", "newton-cg", "trust-krylov"}:
+            raise ValueError(
+                f"Unknown solver_method={self.solver_method!r}. "
+                "Expected lbfgs, newton-cg, or trust-krylov."
+            )
 
         def callback(theta_phi: np.ndarray) -> None:
-            theta = theta_phi[:n]
-            phi = theta_phi[n:]
-            directors = self._angles_to_directors(theta, phi)
-            energy, _ = self.compute_energy_and_gradient(directors)
+            energy, _ = self._angle_objective(theta_phi)
+            energy *= self._energy_scale
             energies.append(energy)
 
-        result = minimize(
-            objective,
-            theta_phi0,
-            method="L-BFGS-B",
-            jac=True,
-            bounds=bounds,
-            callback=callback,
-            options={
+        if method in {"lbfgs", "l-bfgs-b"}:
+            result = minimize(
+                self._angle_objective,
+                theta_phi0,
+                method="L-BFGS-B",
+                bounds=[(None, None)] * (2 * n),
+                jac=True,
+                callback=callback,
+                options={
+                    "maxiter": self.max_iterations,
+                    "ftol": self.tolerance,
+                    "gtol": self.tolerance,
+                    "maxls": 50,
+                },
+            )
+        else:
+            solver_options = {
                 "maxiter": self.max_iterations,
-                "ftol": self.tolerance,
-                "gtol": self.tolerance,
-                "maxls": 50,
-            },
-        )
+                "disp": False,
+            }
+            if method == "newton-cg":
+                # Newton-CG uses `xtol` rather than `gtol`.
+                solver_options["xtol"] = self.tolerance
+            else:
+                solver_options["gtol"] = self.tolerance
+
+            result = minimize(
+                self._angle_objective,
+                theta_phi0,
+                method=method,
+                hessp=self._angle_hessp,
+                jac=True,
+                callback=callback,
+                options=solver_options,
+            )
 
         final_theta = result.x[:n]
         final_phi = result.x[n:]
@@ -534,6 +582,7 @@ def run_fem_solver(
     run_time: int = 500,
     output_prefix: str = "fem",
     anchoring_preset: str = "planar_side_homeotropic_caps",
+    solver_method: str = "trust-krylov",
 ) -> Tuple[LiquidCrystalFEMSolver, List[float]]:
     """Convenience wrapper for the main program."""
     # Apply Rapini-Papoular anchoring on the full closed cylinder boundary by
@@ -542,6 +591,7 @@ def run_fem_solver(
         coordinates_file,
         max_iterations=run_time,
         anchoring_preset=anchoring_preset,
+        solver_method=solver_method,
     )
     if checkpoint_file:
         solver.load_director_field(checkpoint_file)

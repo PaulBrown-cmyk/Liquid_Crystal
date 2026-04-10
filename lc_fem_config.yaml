@@ -1,0 +1,17 @@
+# Default configuration for the liquid-crystal FEM solver.
+# CLI flags in lc_wkcp2.py override these values when supplied.
+
+coordinates_file: straight_cylinder_grid_with_grid.txt
+checkpoint_file: null
+run_time: 500
+output_prefix: cholesteric_fem
+anchoring_preset: planar_side_homeotropic_caps
+solver_method: trust-krylov
+
+grid:
+  diameter_um: 5
+  length_um: 20
+  num_boundary_points_per_z: 20
+  num_z_levels: 20
+  num_inner_points: 20
+  min_distance_um: 1.0
