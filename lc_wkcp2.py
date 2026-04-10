@@ -6,16 +6,24 @@ import os
 import sys
 import pstats
 import signal
+import warnings
 import imageio
 import logging
 import cProfile
 import numpy as np
+
+# Keep Matplotlib's cache in a writable location when running on a headless
+# shell or CI host.
+os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "codex_mplconfig"))
+os.environ.setdefault("XDG_CACHE_HOME", os.path.join("/tmp", "codex_cache"))
+
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 from mpl_toolkits.mplot3d import Axes3D
 from multiprocessing import Pool, cpu_count, Array, Manager, Lock
+from lc_fem import run_fem_solver
 plt.rcParams.update({
     "text.usetex": False,
     "font.family": "DejaVu Sans",
@@ -76,7 +84,17 @@ def profile(func):
     return wrapper
 
 class LiquidCrystalCylinder:
+    """Legacy Monte Carlo cylinder solver.
+
+    This implementation is quarantined for comparison and historical reference
+    only. The FEM continuum solver in lc_fem.py is the supported path.
+    """
     def __init__(self, coordinates_file, A=1.0e5, U=3.5, S=0.73, W=1.0e-5, kT=4.11e-21):
+        warnings.warn(
+            "LiquidCrystalCylinder is legacy/quarantined; use the FEM solver in lc_fem.py instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.A = A
         self.U = U
         self.S = S
@@ -337,8 +355,9 @@ class LiquidCrystalCylinder:
         return total_energy
 
     def apply_periodic_boundary_conditions(self):
-        # Cylindrical geometry is not periodic; the boundary is handled explicitly
-        # by the surface energy term and the geometry masks.
+        # Legacy no-op: a finite cylinder is not periodic. Rapini-Papoular
+        # anchoring is applied explicitly in the surface-energy term, so there
+        # is no periodic wraparound to enforce here.
         return self.n_x, self.n_y, self.n_z
 
     def plot_director_field(self, ax, iteration=None):
@@ -608,52 +627,59 @@ class LiquidCrystalCylinder:
         plt.savefig('histogram.jpg', dpi=600)
         #plt.show()
 
+
+def ensure_default_cylinder_grid(filename: str) -> str:
+    """Create the default straight-cylinder grid if it is missing.
+
+    The continuum solver expects a real point cloud on disk. Generating the
+    canonical geometry here keeps a fresh checkout runnable without requiring a
+    separately saved data artifact.
+    """
+    if os.path.exists(filename):
+        return filename
+
+    from grid1 import CylinderGrid
+
+    cylinder = CylinderGrid(
+        diameter_um=5,
+        length_um=20,
+        num_boundary_points_per_z=20,
+        num_z_levels=20,
+        num_inner_points=20,
+        min_distance_um=1.0,
+    )
+    cylinder.generate_straight_cylinder_with_grid()
+    cylinder.save_grid_to_file(filename)
+    logger.info(f"Generated default cylinder grid at {filename}")
+    return filename
+
 if __name__ == "__main__":
     import os
     import re
 
-    run_time = 20_000
-
-    coordinates_file = 'straight_cylinder_grid_with_grid.txt'  # Path to your coordinates file
+    # The FEM solver is now the main path for production runs. The legacy
+    # Monte Carlo implementation above is kept for comparison and historical
+    # reference, but the entry point uses the continuum formulation.
+    run_time = 500
+    coordinates_file = ensure_default_cylinder_grid("straight_cylinder_grid_with_grid.txt")
     checkpoint_file = None
 
-    checkpoint_files = [file for file in os.listdir() if file.startswith('checkpoint_iter_')]
+    checkpoint_files = [file for file in os.listdir() if file.startswith("checkpoint_iter_")]
     if checkpoint_files:
-        checkpoint_files.sort(key=lambda f: int(re.findall(r'\d+', f)[0]))  # Sort by iteration number
+        checkpoint_files.sort(key=lambda f: int(re.findall(r"\d+", f)[0]))
         checkpoint_file = checkpoint_files[-1]
+        logger.info(f"Found checkpoint {checkpoint_file}; resuming the FEM solver from that state.")
 
-    cylinder = LiquidCrystalCylinder(coordinates_file)
+    solver, energies = run_fem_solver(
+        coordinates_file=coordinates_file,
+        checkpoint_file=checkpoint_file,
+        run_time=run_time,
+        output_prefix="cholesteric_fem",
+    )
+
+    final_energy = energies[-1]
+    logger.info(f"Final continuum free energy: {final_energy / 1000.0} kJ")
 
     fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-
-    if checkpoint_file:
-        cylinder.load_director_field(checkpoint_file)
-        last_iteration = int(re.findall(r'\d+', checkpoint_file)[0])    # sort for the last iteration
-        remaining_iterations = max(0, run_time - last_iteration)
-        logger.info(f'Resuming from checkpoint {checkpoint_file}, remaining iterations: {remaining_iterations}')
-    else:
-        initial_energy = cylinder.compute_elastic_free_energy(cylinder.n_x, cylinder.n_y, cylinder.n_z)
-        logger.info(f'Initial elastic free energy: {initial_energy}')
-
-        remaining_iterations = run_time
-
-    energies = []
-    try:
-        energies = cylinder.minimize_free_energy_monte_carlo(ax, iterations=remaining_iterations, parallel=False, checkpoint_file=checkpoint_file)
-    except KeyboardInterrupt:
-        logger.info('Execution interrupted by user')
-
-    if not energies:
-        energies = [cylinder.compute_elastic_free_energy(cylinder.n_x, cylinder.n_y, cylinder.n_z)]
-
-    final_energy_mc = energies[-1]
-    logger.info(f'Final elastic free energy (Monte Carlo): {final_energy_mc / 1000.} kJ')
-
-    cylinder.plot_director_field(ax)
-
-    cylinder.plot_angle_histogram()
-
-    cylinder.plot_energy_per_iteration(energies)
-
-    cylinder.create_movie_from_checkpoints(output_filename='cholesteric_LC_simulation.mp4', frame_rate=5)
+    ax = fig.add_subplot(111, projection="3d")
+    solver.plot_director_field(ax, title="Relaxed FEM Director Field")
